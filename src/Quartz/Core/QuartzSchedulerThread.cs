@@ -20,11 +20,13 @@
 using System;
 using System.Collections.Generic;
 using System.Data.Common;
+using System.Diagnostics;
 using System.Threading;
 
 using Common.Logging;
 
 using Quartz.Spi;
+using StackifyLib;
 
 namespace Quartz.Core
 {
@@ -254,6 +256,8 @@ namespace Quartz.Core
 
             while (!halted)
             {
+
+
                 try
                 {
                     // check if we're supposed to pause...
@@ -276,215 +280,13 @@ namespace Quartz.Core
                             break;
                         }
                     }
-
-                    int availThreadCount = qsRsrcs.ThreadPool.BlockForAvailableThreads();
-                    if (availThreadCount > 0) // will always be true, due to semantics of blockForAvailableThreads...
-                    {
-                        IList<IOperableTrigger> triggers;
-
-                        DateTimeOffset now = SystemTime.UtcNow();
-
-                        ClearSignaledSchedulingChange();
-                        try
+                    //Could remove this if we make AcquireNextTriggers its own operation in the profiler code
+                    ProfileTracer.CreateAsOperation("QuartzMain-RunLoop", Guid.NewGuid().ToString()).Exec(
+                        () =>
                         {
-                            triggers = qsRsrcs.JobStore.AcquireNextTriggers(
-                                now + idleWaitTime, Math.Min(availThreadCount, qsRsrcs.MaxBatchSize), qsRsrcs.BatchTimeWindow);
-                            lastAcquireFailed = false;
-                            if (log.IsDebugEnabled)
-                            {
-                                log.DebugFormat("Batch acquisition of {0} triggers", (triggers == null ? 0 : triggers.Count));
-                            }
-                        }
-                        catch (JobPersistenceException jpe)
-                        {
-                            if (!lastAcquireFailed)
-                            {
-                                qs.NotifySchedulerListenersError("An error occurred while scanning for the next trigger to fire.", jpe);
-                            }
-                            lastAcquireFailed = true;
-                            continue;
-                        }
-                        catch (Exception e)
-                        {
-                            if (!lastAcquireFailed)
-                            {
-                                Log.Error("quartzSchedulerThreadLoop: RuntimeException " + e.Message, e);
-                            }
-                            lastAcquireFailed = true;
-                            continue;
-                        }
+                            lastAcquireFailed = RunLoop(lastAcquireFailed);
+                        });
 
-                        if (triggers != null && triggers.Count > 0)
-                        {
-                            now = SystemTime.UtcNow();
-                            DateTimeOffset triggerTime = triggers[0].GetNextFireTimeUtc().Value;
-                            TimeSpan timeUntilTrigger =  triggerTime - now;
-
-                            while (timeUntilTrigger > TimeSpan.Zero) 
-                            {
-                                if (ReleaseIfScheduleChangedSignificantly(triggers, triggerTime))
-                                {
-                                    break;
-                                }
-                                lock (sigLock)
-                                {
-                                    if (halted)
-                                    {
-                                        break;
-                                    }
-                                    if (!IsCandidateNewTimeEarlierWithinReason(triggerTime, false))
-                                    {
-                                        try
-                                        {
-                                            // we could have blocked a long while
-                                            // on 'synchronize', so we must recompute
-                                            now = SystemTime.UtcNow();
-                                            timeUntilTrigger = triggerTime - now;
-                                            if (timeUntilTrigger > TimeSpan.Zero)
-                                            {
-                                                Monitor.Wait(sigLock, timeUntilTrigger);
-                                            }
-                                        }
-                                        catch (ThreadInterruptedException)
-                                        {
-                                        }
-                                    }
-                                }
-                                if (ReleaseIfScheduleChangedSignificantly(triggers, triggerTime))
-                                {
-                                    break;
-                                } 
-                                now = SystemTime.UtcNow();
-                                timeUntilTrigger = triggerTime - now;
-                            }
-
-                            // this happens if releaseIfScheduleChangedSignificantly decided to release triggers
-                            if (triggers.Count == 0)
-                            {
-                                continue;
-                            }
-                                              
-                            // set triggers to 'executing'
-                            IList<TriggerFiredResult> bndles = new List<TriggerFiredResult>();
-
-                            bool goAhead;
-                            lock (sigLock) 
-                            {
-                        	    goAhead = !halted;
-                            }
-
-                            if (goAhead)
-                            {
-                                try
-                                {
-                                    IList<TriggerFiredResult> res = qsRsrcs.JobStore.TriggersFired(triggers);
-                                    if (res != null)
-                                    {
-                                        bndles = res;
-                                    }
-                                }
-                                catch (SchedulerException se)
-                                {
-                                    qs.NotifySchedulerListenersError("An error occurred while firing triggers '" + triggers + "'", se);
-                                    // QTZ-179 : a problem occurred interacting with the triggers from the db
-                                    // we release them and loop again
-                                    foreach (IOperableTrigger t in triggers)
-                                    {
-                                        qsRsrcs.JobStore.ReleaseAcquiredTrigger(t);
-                                    }
-                                    continue;
-                                }
-
-                            }
-                            
-
-                        for (int i = 0; i < bndles.Count; i++)
-                        {
-                            TriggerFiredResult result = bndles[i];
-                            TriggerFiredBundle bndle = result.TriggerFiredBundle;
-                            Exception exception = result.Exception;
-
-                            IOperableTrigger trigger = triggers[i];
-                            // TODO SQL exception?
-                            if (exception != null &&  (exception is DbException || exception.InnerException is DbException))
-                            {
-                                Log.Error("DbException while firing trigger " + trigger, exception);
-                                qsRsrcs.JobStore.ReleaseAcquiredTrigger(trigger);
-                                continue;
-                            }
-
-                            // it's possible to get 'null' if the triggers was paused,
-                            // blocked, or other similar occurrences that prevent it being
-                            // fired at this time...  or if the scheduler was shutdown (halted)
-                            if (bndle == null)
-                            {
-                                qsRsrcs.JobStore.ReleaseAcquiredTrigger(trigger);
-                                continue;
-                            }
-
-                            // TODO: improvements:
-                            //
-                            // 2- make sure we can get a job runshell before firing trigger, or
-                            //   don't let that throw an exception (right now it never does,
-                            //   but the signature says it can).
-                            // 3- acquire more triggers at a time (based on num threads available?)
-
-                            JobRunShell shell;
-                            try
-                            {
-                                shell = qsRsrcs.JobRunShellFactory.CreateJobRunShell(bndle);
-                                shell.Initialize(qs);
-                            }
-                            catch (SchedulerException)
-                            {
-                                qsRsrcs.JobStore.TriggeredJobComplete(trigger, bndle.JobDetail, SchedulerInstruction.SetAllJobTriggersError);
-                                continue;
-                            }
-
-                            if (qsRsrcs.ThreadPool.RunInThread(shell) == false)
-                            {
-                                    // this case should never happen, as it is indicative of the
-                                    // scheduler being shutdown or a bug in the thread pool or
-                                    // a thread pool being used concurrently - which the docs
-                                    // say not to do...
-                                    Log.Error("ThreadPool.runInThread() return false!");
-                                    qsRsrcs.JobStore.TriggeredJobComplete(trigger, bndle.JobDetail, SchedulerInstruction.SetAllJobTriggersError);
-                            }
-                        }
-
-                            continue; // while (!halted)
-                        }
-                    }
-                    else // if(availThreadCount > 0)
-                    {
-                        // should never happen, if threadPool.blockForAvailableThreads() follows contract
-                        continue;
-                        // while (!halted)
-                    }
-
-                    DateTimeOffset utcNow = SystemTime.UtcNow();
-                    DateTimeOffset waitTime = utcNow.Add(GetRandomizedIdleWaitTime());
-                    TimeSpan timeUntilContinue = waitTime - utcNow;
-                    lock (sigLock)
-                    {
-                        if (!halted)
-                        {
-                            try
-                            {
-                                // QTZ-336 A job might have been completed in the mean time and we might have
-                                // missed the scheduled changed signal by not waiting for the notify() yet
-                                // Check that before waiting for too long in case this very job needs to be
-                                // scheduled very soon
-                                if (!IsScheduleChanged())
-                                {
-                                    Monitor.Wait(sigLock, timeUntilContinue);
-                                }
-                            }
-                            catch (ThreadInterruptedException)
-                            {
-                            }
-                        }
-                    }
                 }
                 catch (Exception re)
                 {
@@ -493,6 +295,8 @@ namespace Quartz.Core
                         Log.Error("Runtime error occurred in main trigger firing loop.", re);
                     }
                 }
+
+
             } // while (!halted)
 
             // drop references to scheduler stuff to aid garbage collection...
@@ -500,6 +304,234 @@ namespace Quartz.Core
             qsRsrcs = null;
         }
 
+        private bool RunLoop(bool lastAcquireFailed)
+        {
+            int availThreadCount = qsRsrcs.ThreadPool.BlockForAvailableThreads();
+            if (availThreadCount > 0) // will always be true, due to semantics of blockForAvailableThreads...
+            {
+                IList<IOperableTrigger> triggers = null;
+
+                DateTimeOffset now = SystemTime.UtcNow();
+
+                ClearSignaledSchedulingChange();
+                try
+                {
+                    triggers = qsRsrcs.JobStore.AcquireNextTriggers(
+                        now + idleWaitTime, Math.Min(availThreadCount, qsRsrcs.MaxBatchSize),
+                        qsRsrcs.BatchTimeWindow);
+
+                    lastAcquireFailed = false;
+                    if (log.IsDebugEnabled)
+                    {
+                        log.DebugFormat("Batch acquisition of {0} triggers",
+                            (triggers == null ? 0 : triggers.Count));
+                    }
+
+                }
+                catch (JobPersistenceException jpe)
+                {
+                    if (!lastAcquireFailed)
+                    {
+                        qs.NotifySchedulerListenersError("An error occurred while scanning for the next trigger to fire.", jpe);
+                    }
+                    return true;
+                }
+                catch (Exception e)
+                {
+                    if (!lastAcquireFailed)
+                    {
+                        Log.Error("quartzSchedulerThreadLoop: RuntimeException " + e.Message, e);
+                    }
+                    return true;
+                }
+
+                if (triggers != null && triggers.Count > 0)
+                {
+                    WaitForFireTime(triggers);
+
+                    // this happens if releaseIfScheduleChangedSignificantly decided to release triggers
+                    if (triggers.Count == 0)
+                    {
+                        return lastAcquireFailed;
+                    }
+
+                    // set triggers to 'executing'
+                    IList<TriggerFiredResult> bndles = new List<TriggerFiredResult>();
+
+                    bool goAhead;
+                    lock (sigLock)
+                    {
+                        goAhead = !halted;
+                    }
+
+                    if (goAhead)
+                    {
+                        try
+                        {
+                            IList<TriggerFiredResult> res = qsRsrcs.JobStore.TriggersFired(triggers);
+                            if (res != null)
+                            {
+                                bndles = res;
+                            }
+                        }
+                        catch (SchedulerException se)
+                        {
+                            qs.NotifySchedulerListenersError(
+                                "An error occurred while firing triggers '" + triggers + "'", se);
+                            // QTZ-179 : a problem occurred interacting with the triggers from the db
+                            // we release them and loop again
+                            foreach (IOperableTrigger t in triggers)
+                            {
+                                qsRsrcs.JobStore.ReleaseAcquiredTrigger(t);
+                            }
+                            return lastAcquireFailed;
+                        }
+
+                    }
+
+                    RunJobs(bndles, triggers);
+
+                    return lastAcquireFailed;  // while (!halted)
+                }
+            }
+            else // if(availThreadCount > 0)
+            {
+                // should never happen, if threadPool.blockForAvailableThreads() follows contract
+                return lastAcquireFailed;
+                // while (!halted)
+            }
+
+            DateTimeOffset utcNow = SystemTime.UtcNow();
+            DateTimeOffset waitTime = utcNow.Add(GetRandomizedIdleWaitTime());
+            TimeSpan timeUntilContinue = waitTime - utcNow;
+            lock (sigLock)
+            {
+                if (!halted)
+                {
+                    try
+                    {
+                        // QTZ-336 A job might have been completed in the mean time and we might have
+                        // missed the scheduled changed signal by not waiting for the notify() yet
+                        // Check that before waiting for too long in case this very job needs to be
+                        // scheduled very soon
+                        if (!IsScheduleChanged())
+                        {
+                            Monitor.Wait(sigLock, timeUntilContinue);
+                        }
+                    }
+                    catch (ThreadInterruptedException)
+                    {
+                    }
+                }
+            }
+
+            return lastAcquireFailed;
+        }
+
+        private void WaitForFireTime(IList<IOperableTrigger> triggers)
+        {
+            var now = SystemTime.UtcNow();
+            DateTimeOffset triggerTime = triggers[0].GetNextFireTimeUtc().Value;
+            TimeSpan timeUntilTrigger = triggerTime - now;
+
+            while (timeUntilTrigger > TimeSpan.Zero)
+            {
+                if (ReleaseIfScheduleChangedSignificantly(triggers, triggerTime))
+                {
+                    break;
+                }
+                lock (sigLock)
+                {
+                    if (halted)
+                    {
+                        break;
+                    }
+                    if (!IsCandidateNewTimeEarlierWithinReason(triggerTime, false))
+                    {
+                        try
+                        {
+                            // we could have blocked a long while
+                            // on 'synchronize', so we must recompute
+                            now = SystemTime.UtcNow();
+                            timeUntilTrigger = triggerTime - now;
+                            if (timeUntilTrigger > TimeSpan.Zero)
+                            {
+                                Monitor.Wait(sigLock, timeUntilTrigger);
+                            }
+                        }
+                        catch (ThreadInterruptedException)
+                        {
+                        }
+                    }
+                }
+                if (ReleaseIfScheduleChangedSignificantly(triggers, triggerTime))
+                {
+                    break;
+                }
+                now = SystemTime.UtcNow();
+                timeUntilTrigger = triggerTime - now;
+            }
+        }
+
+        private void RunJobs(IList<TriggerFiredResult> bndles, IList<IOperableTrigger> triggers)
+        {
+            for (int i = 0; i < bndles.Count; i++)
+            {
+                TriggerFiredResult result = bndles[i];
+                TriggerFiredBundle bndle = result.TriggerFiredBundle;
+                Exception exception = result.Exception;
+
+                IOperableTrigger trigger = triggers[i];
+                // TODO SQL exception?
+                if (exception != null &&
+                    (exception is DbException || exception.InnerException is DbException))
+                {
+                    Log.Error("DbException while firing trigger " + trigger, exception);
+                    qsRsrcs.JobStore.ReleaseAcquiredTrigger(trigger);
+                    continue;
+                }
+
+                // it's possible to get 'null' if the triggers was paused,
+                // blocked, or other similar occurrences that prevent it being
+                // fired at this time...  or if the scheduler was shutdown (halted)
+                if (bndle == null)
+                {
+                    qsRsrcs.JobStore.ReleaseAcquiredTrigger(trigger);
+                    continue;
+                }
+
+                // TODO: improvements:
+                //
+                // 2- make sure we can get a job runshell before firing trigger, or
+                //   don't let that throw an exception (right now it never does,
+                //   but the signature says it can).
+                // 3- acquire more triggers at a time (based on num threads available?)
+
+                JobRunShell shell;
+                try
+                {
+                    shell = qsRsrcs.JobRunShellFactory.CreateJobRunShell(bndle);
+                    shell.Initialize(qs);
+                }
+                catch (SchedulerException)
+                {
+                    qsRsrcs.JobStore.TriggeredJobComplete(trigger, bndle.JobDetail,
+                        SchedulerInstruction.SetAllJobTriggersError);
+                    continue;
+                }
+
+                if (qsRsrcs.ThreadPool.RunInThread(shell) == false)
+                {
+                    // this case should never happen, as it is indicative of the
+                    // scheduler being shutdown or a bug in the thread pool or
+                    // a thread pool being used concurrently - which the docs
+                    // say not to do...
+                    Log.Error("ThreadPool.runInThread() return false!");
+                    qsRsrcs.JobStore.TriggeredJobComplete(trigger, bndle.JobDetail,
+                        SchedulerInstruction.SetAllJobTriggersError);
+                }
+            }
+        }
 
         private bool ReleaseIfScheduleChangedSignificantly(IList<IOperableTrigger> triggers, DateTimeOffset triggerTime)
         {
@@ -513,10 +545,9 @@ namespace Quartz.Core
                 triggers.Clear();
                 return true;
             }
-            
+
             return false;
         }
-
         private bool IsCandidateNewTimeEarlierWithinReason(DateTimeOffset oldTimeUtc, bool clearSignal) 
         {    	
 		    // So here's the deal: We know due to being signaled that 'the schedule'
@@ -573,6 +604,6 @@ namespace Quartz.Core
     			
 			    return earlier;
             }
-	    }
+	}
     }
 }

@@ -25,6 +25,7 @@ using System.Data;
 using System.Data.SqlClient;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 
@@ -279,6 +280,12 @@ namespace Quartz.Impl.AdoJobStore
         /// </summary>
         public virtual bool DontSetAutoCommitFalse { get; set; }
 
+
+        public virtual bool BatchSqlUpdates { get; set; }
+
+        public virtual bool BatchSqlQueries { get; set; }
+
+
         /// <summary> 
         /// Set the transaction isolation level of DB connections to sequential.
         /// </summary>
@@ -357,10 +364,10 @@ namespace Quartz.Impl.AdoJobStore
         /// Gets the connection and starts a new transaction.
         /// </summary>
         /// <returns></returns>
-        protected virtual ConnectionAndTransactionHolder GetConnection()
+        protected virtual ConnectionAndTransactionHolder GetConnection(bool useTransaction = true)
         {
             IDbConnection conn;
-            IDbTransaction tx;
+            IDbTransaction tx = null;
             try
             {
                 conn = ConnectionManager.GetConnection(DataSource);
@@ -376,22 +383,25 @@ namespace Quartz.Impl.AdoJobStore
                 throw new JobPersistenceException(string.Format("Could not get connection from DataSource '{0}'", DataSource));
             }
 
-            try
+            if (useTransaction)
             {
-                if (TxIsolationLevelSerializable)
+                try
                 {
-                    tx = conn.BeginTransaction(IsolationLevel.Serializable);
+                    if (TxIsolationLevelSerializable)
+                    {
+                        tx = conn.BeginTransaction(IsolationLevel.Serializable);
+                    }
+                    else
+                    {
+                        // default
+                        tx = conn.BeginTransaction(IsolationLevel.ReadCommitted);
+                    }
                 }
-                else
+                catch (Exception e)
                 {
-                    // default
-                    tx = conn.BeginTransaction(IsolationLevel.ReadCommitted);
+                    conn.Close();
+                    throw new JobPersistenceException("Failure setting up connection.", e);
                 }
-            }
-            catch (Exception e)
-            {
-                conn.Close();
-                throw new JobPersistenceException("Failure setting up connection.", e);
             }
 
             return new ConnectionAndTransactionHolder(conn, tx);
@@ -969,11 +979,26 @@ namespace Quartz.Impl.AdoJobStore
         /// <summary>
         /// Insert or update a trigger.
         /// </summary>
-        protected virtual void StoreTrigger(ConnectionAndTransactionHolder conn, IOperableTrigger newTrigger, IJobDetail job, bool replaceExisting, string state, bool forceState, bool recovering)
+        protected virtual void StoreTrigger(ConnectionAndTransactionHolder conn, IOperableTrigger newTrigger,
+            IJobDetail job, bool replaceExisting, string state, bool forceState, bool recovering)
         {
             bool existingTrigger = TriggerExists(conn, newTrigger.Key);
 
+            if ((existingTrigger) && (!replaceExisting))
+            {
+                throw new ObjectAlreadyExistsException(newTrigger);
+            }
 
+            conn.CreateBatchCommand = this.BatchSqlUpdates;
+            StoreTriggerCore(conn, newTrigger, job, replaceExisting, state, forceState, recovering, existingTrigger);
+            Delegate.ExecuteBatchCommand(conn);
+        }
+
+        /// <summary>
+        /// Insert or update a trigger.
+        /// </summary>
+        protected virtual void StoreTriggerCore(ConnectionAndTransactionHolder conn, IOperableTrigger newTrigger, IJobDetail job, bool replaceExisting, string state, bool forceState, bool recovering, bool existingTrigger)
+        {
             if ((existingTrigger) && (!replaceExisting))
             {
                 throw new ObjectAlreadyExistsException(newTrigger);
@@ -1011,10 +1036,12 @@ namespace Quartz.Impl.AdoJobStore
                     throw new JobPersistenceException("The job (" + newTrigger.JobKey +
                                                       ") referenced by the trigger does not exist.");
                 }
+
                 if (job.ConcurrentExecutionDisallowed && !recovering)
                 {
                     state = CheckBlockedState(conn, job.Key, state);
                 }
+
                 if (existingTrigger)
                 {
                     Delegate.UpdateTrigger(conn, newTrigger, state, job);
@@ -2461,7 +2488,7 @@ namespace Quartz.Impl.AdoJobStore
                 currentLoopCount++;
                 try
                 {
-                    IList<TriggerKey> keys = Delegate.SelectTriggerToAcquire(conn, noLaterThan + timeWindow, MisfireTime, maxCount);
+                    IList<TriggerStatus> keys = Delegate.SelectTriggerToAcquire(conn, noLaterThan + timeWindow, MisfireTime, maxCount);
 
                     // No trigger is ready to fire yet.
                     if (keys == null || keys.Count == 0)
@@ -2471,10 +2498,35 @@ namespace Quartz.Impl.AdoJobStore
 
                     DateTimeOffset batchEnd = noLaterThan;
 
-                    foreach (TriggerKey triggerKey in keys)
+                    conn.CreateBatchCommand = this.BatchSqlUpdates;
+
+                    List<IOperableTrigger> triggerList = null;
+                    List<IJobDetail> jobList = null;
+
+                    //get all the jobs at once
+                    if (this.BatchSqlQueries)
                     {
-                        // If our trigger is no longer available, try a new one.
-                        IOperableTrigger nextTrigger = RetrieveTrigger(conn, triggerKey);
+                        jobList = Delegate.SelectJobDetailList(conn, keys.Select(x => x.JobKey).ToList(), TypeLoadHelper);
+                        triggerList = Delegate.SelectTriggerList(conn, keys.Select(x => x.Key).ToList());
+                    }
+
+                    foreach (TriggerStatus status in keys)
+                    {
+                        TriggerKey triggerKey = status.Key;
+
+                        IOperableTrigger nextTrigger = null;
+
+                        if (triggerList != null && this.BatchSqlQueries)
+                        {
+                            nextTrigger = triggerList.FirstOrDefault(x => x.Key == (triggerKey));
+                        }
+
+                        if (nextTrigger == null)
+                        {
+                            // If our trigger is no longer available, try a new one.
+                            nextTrigger = RetrieveTrigger(conn, triggerKey);
+                        }
+
                         if (nextTrigger == null)
                         {
                             continue; // next trigger
@@ -2483,22 +2535,55 @@ namespace Quartz.Impl.AdoJobStore
                         // If trigger's job is set as @DisallowConcurrentExecution, and it has already been added to result, then
                         // put it back into the timeTriggers set and continue to search for next trigger.
                         JobKey jobKey = nextTrigger.JobKey;
-                        IJobDetail job;
-                        try
+
+                        IJobDetail job = null;
+
+                        if (jobList != null && this.BatchSqlQueries)
                         {
-                            job = RetrieveJob(conn, jobKey);
+                            //Go find the job
+                            var findIt =
+                                jobList.FirstOrDefault(x => x.Key == jobKey);
+
+                            if (findIt != null)
+                            {
+                                //This was specifically added for batching purposes so when we Fire the triggers later we don't have to back and look this up again
+                                nextTrigger.JobDetail = findIt;
+                                job = findIt;
+                            }
+                            else
+                            {
+                                log.Debug("Didn't find job from the batch query");
+                            }
                         }
-                        catch (JobPersistenceException jpe)
+
+
+                        //will be null if not batching
+                        if (job == null)
                         {
                             try
                             {
-                                Log.Error("Error retrieving job, setting trigger state to ERROR.", jpe);
-                                Delegate.UpdateTriggerState(conn, triggerKey, StateError);
+                                job = RetrieveJob(conn, jobKey);
                             }
-                            catch (Exception ex)
+                            catch (JobPersistenceException jpe)
                             {
-                                Log.Error("Unable to set trigger state to ERROR.", ex);
+                                try
+                                {
+                                    Log.Error("Error retrieving job, setting trigger state to ERROR.", jpe);
+                                    Delegate.UpdateTriggerState(conn, triggerKey, StateError);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Log.Error("Unable to set trigger state to ERROR.", ex);
+                                }
+                                continue;
                             }
+
+                        }
+
+                        if (job == null)
+                        {
+                            Log.Error("Error retrieving job, setting trigger state to ERROR.");
+                            Delegate.UpdateTriggerState(conn, nextTrigger.Key, StateError);
                             continue;
                         }
 
@@ -2521,12 +2606,15 @@ namespace Quartz.Impl.AdoJobStore
 
                         // We now have a acquired trigger, let's add to return list.
                         // If our trigger was no longer in the expected state, try a new one.
-                        int rowsUpdated = Delegate.UpdateTriggerStateFromOtherState(conn, triggerKey, StateAcquired, StateWaiting);
-                        if (rowsUpdated <= 0)
+                        int rowsUpdated = 0;
+
+                        rowsUpdated = Delegate.UpdateTriggerStateFromOtherState(conn, nextTrigger.Key, StateAcquired, StateWaiting);
+                        if (!this.BatchSqlUpdates && rowsUpdated <= 0)
                         {
                             // TODO: Hum... shouldn't we log a warning here?
                             continue; // next trigger
                         }
+
                         nextTrigger.FireInstanceId = GetFiredTriggerRecordId();
                         Delegate.InsertFiredTrigger(conn, nextTrigger, StateAcquired, null);
 
@@ -2541,6 +2629,9 @@ namespace Quartz.Impl.AdoJobStore
 
                         acquiredTriggers.Add(nextTrigger);
                     }
+
+                    //if batching
+                    Delegate.ExecuteBatchCommand(conn);
 
                     // if we didn't end up with any trigger to fire from that first
                     // batch, try again for another batch. We allow with a max retry count.
@@ -2570,7 +2661,16 @@ namespace Quartz.Impl.AdoJobStore
         /// </summary>
         public void ReleaseAcquiredTrigger(IOperableTrigger trigger)
         {
-            RetryExecuteInNonManagedTXLock(LockTriggerAccess, conn => ReleaseAcquiredTrigger(conn, trigger));
+            if (this.BatchSqlUpdates)
+            {
+                RetryExecuteInBatchTransaction(
+                    TxIsolationLevelSerializable ? IsolationLevel.Serializable : IsolationLevel.ReadCommitted,
+                    LockTriggerAccess, conn => ReleaseAcquiredTrigger(conn, trigger));
+            }
+            else
+            {
+                RetryExecuteInNonManagedTXLock(LockTriggerAccess, conn => ReleaseAcquiredTrigger(conn, trigger));
+            }
         }
 
         protected virtual void ReleaseAcquiredTrigger(ConnectionAndTransactionHolder conn, IOperableTrigger trigger)
@@ -2592,29 +2692,62 @@ namespace Quartz.Impl.AdoJobStore
             return ExecuteInNonManagedTXLock(LockTriggerAccess,
                 conn =>
                 {
-                    List<TriggerFiredResult> results = new List<TriggerFiredResult>();
+                    //Get all of the current statuses on the triggers
+                    List<TriggerStatus> triggerStates = null;
 
+                    if (this.BatchSqlQueries)
+                    {
+                        triggerStates = Delegate.SelectTriggerStateList(conn, triggers.Select(x => x.Key).ToList());
+                    }
+
+                    conn.CreateBatchCommand = this.BatchSqlUpdates;
+
+                    List<TriggerFiredResult> results = new List<TriggerFiredResult>();
                     TriggerFiredResult result;
                     foreach (IOperableTrigger trigger in triggers)
                     {
-                        try
+
+                        //this code section only for the batching
+                        bool notAcquired = false;
+
+                        if (triggerStates != null && this.BatchSqlQueries)
                         {
-                            TriggerFiredBundle bundle = TriggerFired(conn, trigger);
-                            result = new TriggerFiredResult(bundle);
+                            var findState = triggerStates.FirstOrDefault(
+                                                      x => x.Key.Group == trigger.Key.Group && x.Key.Name == trigger.Key.Name);
+
+                            if (findState == null || !findState.Status.Equals(StateAcquired))
+                            {
+                                notAcquired = true;
+                            }
                         }
-                        catch (JobPersistenceException jpe)
+
+
+                        //Making sure all the triggers are set to the status of Acquired
+                        if (notAcquired)
                         {
-                            log.ErrorFormat("Caught job persistence exception: " + jpe.Message, jpe);
-                            result = new TriggerFiredResult(jpe);
+                            result = new TriggerFiredResult((TriggerFiredBundle) null);
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            log.ErrorFormat("Caught exception: " + ex.Message, ex);
-                            result = new TriggerFiredResult(ex);
+                            try
+                            {
+                                TriggerFiredBundle bundle = TriggerFired(conn, trigger);
+                                result = new TriggerFiredResult(bundle);
+                            }
+                            catch (JobPersistenceException jpe)
+                            {
+                                log.ErrorFormat("Caught job persistence exception: " + jpe.Message, jpe);
+                                result = new TriggerFiredResult(jpe);
+                            }
+                            catch (Exception ex)
+                            {
+                                log.ErrorFormat("Caught exception: " + ex.Message, ex);
+                                result = new TriggerFiredResult(ex);
+                            }
                         }
                         results.Add(result);
                     }
-
+                    Delegate.ExecuteBatchCommand(conn);
                     return results;
                 },
                 (conn, result) =>
@@ -2648,46 +2781,56 @@ namespace Quartz.Impl.AdoJobStore
 
         protected virtual TriggerFiredBundle TriggerFired(ConnectionAndTransactionHolder conn, IOperableTrigger trigger)
         {
-            IJobDetail job;
+            //As part of batching, when we acquire the jobs it sets JobDetail so we don't have to look it up here
+            IJobDetail job = trigger.JobDetail;
             ICalendar cal = null;
 
             // Make sure trigger wasn't deleted, paused, or completed...
-            try
-            {
-                // if trigger was deleted, state will be StateDeleted
-                string state = Delegate.SelectTriggerState(conn, trigger.Key);
-                if (!state.Equals(StateAcquired))
-                {
-                    return null;
-                }
-            }
-            catch (Exception e)
-            {
-                throw new JobPersistenceException("Couldn't select trigger state: " + e.Message, e);
-            }
-
-            try
-            {
-                job = RetrieveJob(conn, trigger.JobKey);
-                if (job == null)
-                {
-                    return null;
-                }
-            }
-            catch (JobPersistenceException jpe)
+            if (!this.BatchSqlQueries)
             {
                 try
                 {
-                    Log.Error("Error retrieving job, setting trigger state to ERROR.", jpe);
-                    Delegate.UpdateTriggerState(conn, trigger.Key, StateError);
+                    // if trigger was deleted, state will be StateDeleted
+                    string state = Delegate.SelectTriggerState(conn, trigger.Key);
+                    if (!state.Equals(StateAcquired))
+                    {
+                        return null;
+                    }
                 }
-                catch (Exception sqle)
+                catch (Exception e)
                 {
-                    Log.Error("Unable to set trigger state to ERROR.", sqle);
+                    throw new JobPersistenceException("Couldn't select trigger state: " + e.Message, e);
                 }
-                throw;
             }
 
+            //go get it if it wasn't passed in, but it should have been loaded in the Acquired method
+            if (job == null)
+            {
+                try
+                {
+                    job = RetrieveJob(conn, trigger.JobKey);
+                    if (job == null)
+                    {
+                        return null;
+                    }
+                }
+                catch (JobPersistenceException jpe)
+                {
+                    try
+                    {
+                        Log.Error("Error retrieving job, setting trigger state to ERROR.", jpe);
+                        Delegate.UpdateTriggerState(conn, trigger.Key, StateError);
+                    }
+                    catch (Exception sqle)
+                    {
+                        Log.Error("Unable to set trigger state to ERROR.", sqle);
+                    }
+                    throw;
+                }
+            }
+
+
+            //FYI: there is a calendar cache that happens in RetrieveCalendar
             if (trigger.CalendarName != null)
             {
                 cal = RetrieveCalendar(conn, trigger.CalendarName);
@@ -2696,6 +2839,7 @@ namespace Quartz.Impl.AdoJobStore
                     return null;
                 }
             }
+
 
             try
             {
@@ -2736,7 +2880,15 @@ namespace Quartz.Impl.AdoJobStore
                 force = true;
             }
 
-            StoreTrigger(conn, trigger, job, true, state2, force, false);
+            if (this.BatchSqlQueries)
+            {
+                //Skips the existance check, when batching is done in the outer method
+                StoreTriggerCore(conn, trigger, job, true, state2, force, false, true);
+            }
+            else
+            {
+                StoreTrigger(conn, trigger, job, true, state2, force, false);
+            }
 
             job.JobDataMap.ClearDirtyFlag();
 
@@ -2762,7 +2914,22 @@ namespace Quartz.Impl.AdoJobStore
         public virtual void TriggeredJobComplete(IOperableTrigger trigger, IJobDetail jobDetail,
                                                  SchedulerInstruction triggerInstCode)
         {
-            RetryExecuteInNonManagedTXLock(LockTriggerAccess, conn => TriggeredJobComplete(conn, trigger, jobDetail, triggerInstCode));
+            //This doesn't happen much, let this code path run without batching since it calls off to some other code we don't want to change
+            if (triggerInstCode == SchedulerInstruction.DeleteTrigger)
+            {
+                RetryExecuteInNonManagedTXLock(LockTriggerAccess, conn => TriggeredJobComplete(conn, trigger, jobDetail, triggerInstCode));
+            }
+            else
+            {
+                if (this.BatchSqlUpdates)
+                {
+                    RetryExecuteInBatchTransaction(TxIsolationLevelSerializable ? IsolationLevel.Serializable : IsolationLevel.ReadCommitted, LockTriggerAccess, conn => TriggeredJobComplete(conn, trigger, jobDetail, triggerInstCode));
+                }
+                else
+                {
+                    RetryExecuteInNonManagedTXLock(LockTriggerAccess, conn => TriggeredJobComplete(conn, trigger, jobDetail, triggerInstCode));
+                }
+            }
         }
 
         protected virtual void TriggeredJobComplete(ConnectionAndTransactionHolder conn,
@@ -3403,6 +3570,56 @@ namespace Quartz.Impl.AdoJobStore
                     throw new JobPersistenceException("Couldn't commit ADO.NET transaction. " + e.Message, e);
                 }
             }
+        }
+
+
+        protected virtual void ExecuteInBatchTransaction(IsolationLevel transactionIsolationLevel, string lockName, Action<ConnectionAndTransactionHolder> txCallback)
+        {
+            var conn = GetConnection(false);
+            try
+            {
+                conn.CreateBatchCommand = this.BatchSqlUpdates;
+                txCallback(conn); //does whatever the action was
+                //run the batch command that accumulated
+                Delegate.ExecuteBatchCommandTransaction(conn, transactionIsolationLevel, LockTriggerAccess);
+            }
+            finally 
+            {
+                CleanupConnection(conn);
+            }
+        }
+
+        protected virtual void RetryExecuteInBatchTransaction(IsolationLevel transactionIsolationLevel, string lockName, Action<ConnectionAndTransactionHolder> txCallback)
+        {
+            for (int retry = 1; !shutdown; retry++)
+            {
+                try
+                {
+                    ExecuteInBatchTransaction(transactionIsolationLevel, lockName, txCallback);
+                    return;
+                }
+                catch (JobPersistenceException jpe)
+                {
+                    if (retry % this.RetryableActionErrorLogThreshold == 0)
+                    {
+                        schedSignaler.NotifySchedulerListenersError("An error occurred while " + txCallback, jpe);
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.Error("retryExecuteInNonManagedTXLock: RuntimeException " + e.Message, e);
+                }
+                try
+                {
+                    Thread.Sleep(DbRetryInterval); // retry every N seconds (the db connection must be failed)
+                }
+                catch (ThreadInterruptedException e)
+                {
+                    throw new InvalidOperationException("Received interrupted exception", e);
+                }
+            }
+
+            throw new InvalidOperationException("JobStore is shutdown - aborting retry");
         }
 
         /// <summary>

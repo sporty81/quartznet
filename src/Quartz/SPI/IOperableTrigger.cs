@@ -112,5 +112,7 @@ namespace Quartz.Spi
         void SetNextFireTimeUtc(DateTimeOffset? value);
 
         void SetPreviousFireTimeUtc(DateTimeOffset? value);
+
+        IJobDetail JobDetail { get; set; }
     }
 }

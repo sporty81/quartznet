@@ -73,6 +73,8 @@ namespace Quartz.Impl.Triggers
         [NonSerialized] // we have the key in string fields
         private TriggerKey key;
 
+        public IJobDetail JobDetail { get; set; }
+
 		/// <summary>
         /// Get or sets the name of this <see cref="ITrigger" />.
 		/// </summary>

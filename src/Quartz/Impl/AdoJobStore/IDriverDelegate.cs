@@ -19,7 +19,7 @@
 
 using System;
 using System.Collections.Generic;
-
+using System.Data;
 using Quartz.Impl.Matchers;
 using Quartz.Spi;
 
@@ -193,12 +193,16 @@ namespace Quartz.Impl.AdoJobStore
         /// <returns>The populated JobDetail object</returns>
         IJobDetail SelectJobDetail(ConnectionAndTransactionHolder conn, JobKey jobKey, ITypeLoadHelper classLoadHelper);
 
-		/// <summary>
-		/// Select the total number of jobs stored.
-		/// </summary>
-		/// <param name="conn">The DB Connection</param>
-		/// <returns> the total number of jobs stored</returns>
-		int SelectNumJobs(ConnectionAndTransactionHolder conn);
+        List<IJobDetail> SelectJobDetailList(ConnectionAndTransactionHolder conn, List<JobKey> jobKeys,
+            ITypeLoadHelper loadHelper);
+
+
+        /// <summary>
+        /// Select the total number of jobs stored.
+        /// </summary>
+        /// <param name="conn">The DB Connection</param>
+        /// <returns> the total number of jobs stored</returns>
+        int SelectNumJobs(ConnectionAndTransactionHolder conn);
 
 		/// <summary> 
 		/// Select all of the job group names that are stored.
@@ -206,6 +210,11 @@ namespace Quartz.Impl.AdoJobStore
 		/// <param name="conn">The DB Connection.</param>
 		/// <returns> an array of <see cref="String" /> group names</returns>
         IList<string> SelectJobGroups(ConnectionAndTransactionHolder conn);
+
+        void ExecuteBatchCommand(ConnectionAndTransactionHolder conn);
+
+        void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName);
+
 
         /// <summary>
         /// Select all of the jobs contained in a given group.
@@ -392,7 +401,7 @@ namespace Quartz.Impl.AdoJobStore
 
         /// <summary>
         /// Select the triggers for a calendar
-        /// </summary>
+        /// </summary>      
         /// <param name="conn">The DB Connection.</param>
         /// <param name="calName">Name of the calendar.</param>
         /// <returns>
@@ -409,10 +418,12 @@ namespace Quartz.Impl.AdoJobStore
 		/// </returns>
         IOperableTrigger SelectTrigger(ConnectionAndTransactionHolder conn, TriggerKey triggerKey);
 
-		/// <summary>
-		/// Select a trigger's JobDataMap.
-		/// </summary>
-		/// <param name="conn">The DB Connection.</param>
+        List<IOperableTrigger> SelectTriggerList(ConnectionAndTransactionHolder conn, List<TriggerKey> triggerKeys);
+
+        /// <summary>
+        /// Select a trigger's JobDataMap.
+        /// </summary>
+        /// <param name="conn">The DB Connection.</param>
         /// <param name="triggerKey">The key identifying the trigger.</param>
         /// <returns>The <see cref="JobDataMap" /> of the Trigger, never null, but possibly empty.</returns>
         JobDataMap SelectTriggerJobDataMap(ConnectionAndTransactionHolder conn, TriggerKey triggerKey);
@@ -710,8 +721,10 @@ namespace Quartz.Impl.AdoJobStore
         /// <param name="noLaterThan">highest value of <see cref="ITrigger.GetNextFireTimeUtc" /> of the triggers (exclusive)</param>
         /// <param name="noEarlierThan">highest value of <see cref="ITrigger.GetNextFireTimeUtc" /> of the triggers (inclusive)</param>
         /// <param name="maxCount">maximum number of trigger keys allow to acquired in the returning list.</param>
-        /// <returns>A (never null, possibly empty) list of the identifiers (Key objects) of the next triggers to be fired.</returns>
-        IList<TriggerKey> SelectTriggerToAcquire(ConnectionAndTransactionHolder conn, DateTimeOffset noLaterThan, DateTimeOffset noEarlierThan, int maxCount);
+        /// <returns></returns>
+        IList<TriggerStatus> SelectTriggerToAcquire(ConnectionAndTransactionHolder conn, DateTimeOffset noLaterThan, DateTimeOffset noEarlierThan, int maxCount);
+
+        List<TriggerStatus> SelectTriggerStateList(ConnectionAndTransactionHolder conn, List<TriggerKey> triggerKeys);
 
         /// <summary>
         /// Select the distinct instance names of all fired-trigger records.

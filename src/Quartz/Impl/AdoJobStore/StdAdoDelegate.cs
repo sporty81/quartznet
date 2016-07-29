@@ -26,7 +26,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.Serialization;
-
+using System.Text;
 using Common.Logging;
 
 using Quartz.Impl.AdoJobStore.Common;
@@ -34,6 +34,7 @@ using Quartz.Impl.Matchers;
 using Quartz.Impl.Triggers;
 using Quartz.Spi;
 using Quartz.Util;
+using System.Runtime.Caching;
 
 namespace Quartz.Impl.AdoJobStore
 {
@@ -148,6 +149,102 @@ namespace Quartz.Impl.AdoJobStore
         {
             get { return useProperties; }
         }
+
+        private void ApplyBatchCommand(int commandIndex, ConnectionAndTransactionHolder.BatchCommand source, IDbCommand target)
+        {
+            foreach (IDbDataParameter item in source.Parameters)
+            {
+                source.CommandText = source.CommandText.Replace(item.ParameterName,
+                    item.ParameterName + commandIndex.ToString());
+
+                AddCommandParameter(target, item.ParameterName.TrimStart('@') + commandIndex, item.Value);
+            }
+
+            target.CommandText += source.CommandText + ";\r\n";
+        }
+
+
+        public void ExecuteBatchCommand(ConnectionAndTransactionHolder conn)
+        {
+            if (!conn.CreateBatchCommand)
+                return; //skip
+
+	        //set to false so after this ends it has been reset
+            conn.CreateBatchCommand = false;
+
+
+            if (conn.Commands.Count == 0)
+                return; //nothing to do
+
+            //in case there are 100 commands, take them in smaller chunks
+            foreach (var commandChunk in conn.Commands.InSetsOf(20))
+            {
+                using (var command = conn.Connection.CreateCommand())
+                {
+		            //use transaction if one exists
+                    if (conn.Transaction != null)
+                    {
+                        command.Transaction = conn.Transaction;
+                    }
+
+                    for (int i = 0; i < commandChunk.Count; i++)
+                    {
+                        ApplyBatchCommand(i, commandChunk[i], command);
+                    }
+
+                    command.ExecuteNonQuery();
+                }
+            }
+
+            conn.Commands.Clear();
+        }
+
+        public void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName)
+        {
+            if (!conn.CreateBatchCommand)
+                return; //skip
+
+	        //set to false so after this ends it has been reset
+            conn.CreateBatchCommand = false;
+
+            if (conn.Commands.Count == 0)
+                return; //nothing to do
+
+            if (string.IsNullOrEmpty(lockName))
+                throw new ArgumentException("Missing lockName");
+
+            using (var command = conn.Connection.CreateCommand())
+            {
+             
+                //this code is all SQL Server specific and should be changed for other dbs 
+                if (transactionLevel == IsolationLevel.Serializable)
+                {
+                    command.CommandText += "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\r\n";
+                }
+                else
+                {
+                    command.CommandText += "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\r\n";
+                }
+
+                command.CommandText += "BEGIN TRANSACTION;\r\n";
+                command.CommandText += "SELECT * FROM QRTZ_LOCKS WITH (UPDLOCK,ROWLOCK) WHERE SCHED_NAME = @quartzScheduleName AND LOCK_NAME = @lockName;\r\n";
+
+                AddCommandParameter(command, "quartzScheduleName", schedName);
+                AddCommandParameter(command, "lockname", lockName);
+
+                for (int i = 0; i < conn.Commands.Count; i++)
+                {
+                    ApplyBatchCommand(i, conn.Commands[i], command);
+                }
+
+                command.CommandText += "COMMIT TRANSACTION;";
+
+                command.ExecuteNonQuery();
+            }
+
+            conn.Commands.Clear();
+        }
+
 
         public virtual void AddTriggerPersistenceDelegate(ITriggerPersistenceDelegate del)
         {
@@ -789,6 +886,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "jobName", job.Key.Name);
                 AddCommandParameter(cmd, "jobGroup", job.Key.Group);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -833,6 +936,69 @@ namespace Quartz.Impl.AdoJobStore
                 }
             }
         }
+
+        /// <summary>
+        /// Select the JobDetail object for a given job name / group name.
+        /// </summary>
+        /// <param name="conn">The DB Connection.</param>
+        /// <param name="jobKeys">The key identifying the job.</param>
+        /// <param name="loadHelper">The load helper.</param>
+        /// <returns>The populated JobDetail object.</returns>
+        public virtual List<IJobDetail> SelectJobDetailList(ConnectionAndTransactionHolder conn, List<JobKey> jobKeys, ITypeLoadHelper loadHelper)
+        {
+            var jobDetails = new List<IJobDetail>();
+
+            using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(SqlSelectJobDetailList)))
+            {
+                StringBuilder sb = new StringBuilder();
+
+                sb.Append(" AND (");
+
+                for (int i = 0; i < jobKeys.Count; i++)
+                {
+                    var jobKey = jobKeys[i];
+
+                    if (i > 0)
+                    {
+                        sb.Append(" OR ");
+                    }
+
+                    sb.AppendFormat(" (JOB_NAME = '{0}' AND JOB_GROUP='{1}')", jobKey.Name, jobKey.Group);
+                }
+
+                sb.Append(")");
+                cmd.CommandText += sb.ToString();
+
+                using (IDataReader rs = cmd.ExecuteReader())
+                {
+
+                    while (rs.Read())
+                    {
+                        var job = new JobDetailImpl();
+
+                        job.Name = rs.GetString(ColumnJobName);
+                        job.Group = rs.GetString(ColumnJobGroup);
+                        job.Description = rs.GetString(ColumnDescription);
+                        job.JobType = loadHelper.LoadType(rs.GetString(ColumnJobClass));
+                        job.Durable = GetBooleanFromDbValue(rs[ColumnIsDurable]);
+                        job.RequestsRecovery = GetBooleanFromDbValue(rs[ColumnRequestsRecovery]);
+
+                        IDictionary map = ReadMapFromReader(rs, 6);
+
+                        if (map != null)
+                        {
+                            job.JobDataMap = map as JobDataMap ?? new JobDataMap(map);
+                        }
+                        jobDetails.Add(job);
+                    }
+
+
+                }
+            }
+
+            return jobDetails;
+        }
+
 
         private IDictionary ReadMapFromReader(IDataReader rs, int colIndex)
         {
@@ -1064,7 +1230,16 @@ namespace Quartz.Impl.AdoJobStore
                 }
                 AddCommandParameter(cmd, "triggerPriority", trigger.Priority);
 
-                int insertResult = cmd.ExecuteNonQuery();
+                int insertResult = 0;
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                }
+                else
+                {
+                    insertResult = cmd.ExecuteNonQuery();
+                }
 
                 if (tDel == null)
                 {
@@ -1095,6 +1270,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "triggerName", trigger.Key.Name);
                 AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
                 AddCommandParameter(cmd, "blob", buf, dbProvider.Metadata.DbBinaryType);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
@@ -1172,7 +1353,16 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
             }
 
-            int insertResult = cmd.ExecuteNonQuery();
+            int insertResult = -1;
+
+            if (conn.CreateBatchCommand)
+            {
+                conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+            }
+            else
+            {
+                insertResult = cmd.ExecuteNonQuery();                
+            }
 
             if (tDel == null)
             {
@@ -1202,6 +1392,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "blob", os, dbProvider.Metadata.DbBinaryType);
                 AddCommandParameter(cmd, "triggerName", trigger.Key.Name);
                 AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
@@ -1245,6 +1441,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "state", state);
                 AddCommandParameter(cmd, "triggerName", triggerKey.Name);
                 AddCommandParameter(cmd, "triggerGroup", triggerKey.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters});
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
@@ -1322,6 +1524,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "triggerGroup", triggerKey.Group);
                 AddCommandParameter(cmd, "oldState", oldState);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1343,6 +1551,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "triggerGroup", ToSqlLikeClause(matcher));
                 AddCommandParameter(cmd, "oldState", oldState);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -1361,6 +1575,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "state", state);
                 AddCommandParameter(cmd, "jobName", jobKey.Name);
                 AddCommandParameter(cmd, "jobGroup", jobKey.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
@@ -1384,6 +1604,12 @@ namespace Quartz.Impl.AdoJobStore
                 AddCommandParameter(cmd, "jobName", jobKey.Name);
                 AddCommandParameter(cmd, "jobGroup", jobKey.Group);
                 AddCommandParameter(cmd, "oldState", oldState);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
@@ -1677,6 +1903,166 @@ namespace Quartz.Impl.AdoJobStore
             return trigger;
         }
 
+        public virtual List<IOperableTrigger> SelectTriggerList(ConnectionAndTransactionHolder conn, List<TriggerKey> triggerKeys)
+        {
+            List<IOperableTrigger> triggers = new List<IOperableTrigger>();
+
+            List< TriggerInfo > batchTriggerInfo = new List<TriggerInfo>();
+
+            using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(SqlSelectTriggerList)))
+            {
+
+                StringBuilder sb = new StringBuilder();
+
+                sb.Append(" AND (");
+
+                for (int i = 0; i < triggerKeys.Count; i++)
+                {
+                    var triggerKey = triggerKeys[i];
+
+                    if (i > 0)
+                    {
+                        sb.Append(" OR ");
+                    }
+
+                    sb.AppendFormat(" ({2} = '{0}' AND {3}='{1}')", triggerKey.Name, triggerKey.Group, ColumnTriggerName, ColumnTriggerGroup);
+                }
+
+                sb.Append(")");
+                cmd.CommandText += sb.ToString();
+
+                using (IDataReader rs = cmd.ExecuteReader())
+                {
+                    while (rs.Read())
+                    {
+                        TriggerInfo triggerInfo = new TriggerInfo();
+                        triggerInfo.Key = new TriggerKey(rs.GetString(ColumnTriggerName), rs.GetString(ColumnTriggerGroup));
+                        triggerInfo.JobName = rs.GetString(ColumnJobName);
+                        triggerInfo.JobGroup = rs.GetString(ColumnJobGroup);
+                        triggerInfo.Description = rs.GetString(ColumnDescription);
+                        triggerInfo.TriggerType = rs.GetString(ColumnTriggerType);
+                        triggerInfo.CalendarName = rs.GetString(ColumnCalendarName);
+                        triggerInfo.MisFireInstr = rs.GetInt32(ColumnMifireInstruction);
+                        triggerInfo.Priority = rs.GetInt32(ColumnPriority);
+
+                        triggerInfo.Map = ReadMapFromReader(rs, 11);
+
+                        triggerInfo.NextFireTimeUtc = GetDateTimeFromDbValue(rs[ColumnNextFireTime]);
+                        triggerInfo.PreviousFireTimeUtc = GetDateTimeFromDbValue(rs[ColumnPreviousFireTime]);
+                        triggerInfo.StartTimeUtc = GetDateTimeFromDbValue(rs[ColumnStartTime]) ??
+                                                   DateTimeOffset.MinValue;
+                        triggerInfo.EndTimeUtc = GetDateTimeFromDbValue(rs[ColumnEndTime]);
+
+                        batchTriggerInfo.Add(triggerInfo);
+                    }
+                    // done reading
+                    rs.Close();
+                }
+            }
+
+            Quartz.Impl.AdoJobStore.SimpleTriggerPersistenceDelegate simpleDel =
+              (Quartz.Impl.AdoJobStore.SimpleTriggerPersistenceDelegate)  FindTriggerPersistenceDelegate("SIMPLE");
+
+            //go get them in a batch if we can
+            var simpleTriggerKeys = batchTriggerInfo.Where(x => x.TriggerType == "SIMPLE").Select(x => x.Key).ToList();
+            var simpleTriggerProperties =  simpleDel.LoadExtendedTriggerPropertiesList(conn, simpleTriggerKeys);
+
+
+            foreach (var triggerInfo in batchTriggerInfo)
+            {
+                if (triggerInfo.TriggerType.Equals(TriggerTypeBlob))
+                {
+                    using (IDbCommand cmd2 = PrepareCommand(conn, ReplaceTablePrefix(SqlSelectBlobTrigger)))
+                    {
+                        AddCommandParameter(cmd2, "triggerName", triggerInfo.Key.Name);
+                        AddCommandParameter(cmd2, "triggerGroup", triggerInfo.Key.Group);
+                        using (IDataReader rs2 = cmd2.ExecuteReader())
+                        {
+                            if (rs2.Read())
+                            {
+                                triggers.Add(GetObjectFromBlob<IOperableTrigger>(rs2, 0));
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    TriggerPropertyBundle triggerProps = null;
+
+                    if (simpleTriggerProperties.ContainsKey(triggerInfo.Key))
+                    {
+                        triggerProps = simpleTriggerProperties[triggerInfo.Key];
+                    }
+
+                    if (triggerProps == null)
+                    {
+                        ITriggerPersistenceDelegate tDel = FindTriggerPersistenceDelegate(triggerInfo.TriggerType);
+
+                        if (tDel == null)
+                        {
+                            throw new JobPersistenceException(
+                                "No TriggerPersistenceDelegate for trigger discriminator type: " +
+                                triggerInfo.TriggerType);
+                        }
+
+                        try
+                        {
+                            triggerProps = tDel.LoadExtendedTriggerProperties(conn, triggerInfo.Key);
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            continue;
+                        }
+                    }
+
+                    TriggerBuilder tb = TriggerBuilder.Create()
+                        .WithDescription(triggerInfo.Description)
+                        .WithPriority(triggerInfo.Priority)
+                        .StartAt(triggerInfo.StartTimeUtc)
+                        .EndAt(triggerInfo.EndTimeUtc)
+                        .WithIdentity(triggerInfo.Key)
+                        .ModifiedByCalendar(triggerInfo.CalendarName)
+                        .WithSchedule(triggerProps.ScheduleBuilder)
+                        .ForJob(new JobKey(triggerInfo.JobName, triggerInfo.JobGroup));
+
+                    if (triggerInfo.Map != null)
+                    {
+                        tb.UsingJobData(triggerInfo.Map as JobDataMap ?? new JobDataMap(triggerInfo.Map));
+                    }
+
+                    var trigger = (IOperableTrigger)tb.Build();
+
+                    trigger.MisfireInstruction = triggerInfo.MisFireInstr;
+                    trigger.SetNextFireTimeUtc(triggerInfo.NextFireTimeUtc);
+                    trigger.SetPreviousFireTimeUtc(triggerInfo.PreviousFireTimeUtc);
+
+                    SetTriggerStateProperties(trigger, triggerProps);
+                    triggers.Add(trigger);
+                }
+            }
+
+            return triggers;
+        }
+
+        private class TriggerInfo
+        {
+            public TriggerKey Key { get; set; }
+            public string JobName { get; set; }
+            public string JobGroup { get; set; }
+            public string Description { get; set; }
+            public string TriggerType { get; set; }
+            public string CalendarName { get; set; }
+            public int MisFireInstr { get; set; }
+            public int Priority { get; set; }
+            public IDictionary Map { get; set; }
+
+            public DateTimeOffset? NextFireTimeUtc { get; set; }
+            public DateTimeOffset? PreviousFireTimeUtc { get; set; }
+            public DateTimeOffset StartTimeUtc { get; set; }
+            public DateTimeOffset? EndTimeUtc { get; set; }
+        }
+
+
         private static bool IsTriggerStillPresent(IDbCommand command)
         {
             using (var rs = command.ExecuteReader())
@@ -1752,6 +2138,65 @@ namespace Quartz.Impl.AdoJobStore
                 }
                 return String.Intern(state);
             }
+        }
+
+        /// <summary>
+        /// Select a trigger's state value.
+        /// </summary>
+        /// <param name="conn">the DB Connection</param>
+        /// <param name="triggerKeys">the key of the trigger</param>
+        /// <returns>The <see cref="ITrigger" /> object</returns>
+        public virtual List<TriggerStatus> SelectTriggerStateList(ConnectionAndTransactionHolder conn, List<TriggerKey> triggerKeys)
+        {
+            List < TriggerStatus > triggers = new List<TriggerStatus>();
+
+            using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(SqlSelectTriggerStateList)))
+            {
+                StringBuilder sb = new StringBuilder();
+
+                sb.Append(" AND (");
+
+                for (int i = 0; i < triggerKeys.Count; i++)
+                {
+                    var triggerKey = triggerKeys[i];
+
+                    if (i > 0)
+                    {
+                        sb.Append(" OR ");
+                    }
+
+                    sb.AppendFormat(" ({2} = '{0}' AND {3}='{1}')", triggerKey.Name, triggerKey.Group, ColumnTriggerName, ColumnTriggerGroup);
+                }
+
+                sb.Append(")");
+                cmd.CommandText += sb.ToString();
+
+                using (IDataReader rs = cmd.ExecuteReader())
+                {
+                    while (rs.Read())
+                    {
+                        TriggerStatus status = new TriggerStatus(rs.GetString(ColumnTriggerState), null);
+                        status.Key = new TriggerKey((string)rs[ColumnTriggerName],
+                            (string)rs[ColumnTriggerGroup]);
+
+                        triggers.Add(status);
+                    }
+                }
+            }
+
+            //look for any not found and add them as DELETED
+            foreach (var item in triggerKeys)
+            {
+                if (!triggers.Any(x => x.Key.Group == item.Group && x.Key.Name == item.Name))
+                {
+                    TriggerStatus status = new TriggerStatus("DELETED", null);
+                    status.Key = new TriggerKey(item.Name, item.Group);
+                    triggers.Add(status);
+                }
+            }
+
+
+            return triggers;
         }
 
         /// <summary>
@@ -1965,12 +2410,25 @@ namespace Quartz.Impl.AdoJobStore
         /// </returns>
         public virtual bool IsTriggerGroupPaused(ConnectionAndTransactionHolder conn, string groupName)
         {
+            //cache this lookup for 1 second for performance boost
+            string key = "IsTriggerGroupPaused-" + schedName + " - " + groupName;
+
+            if (MemoryCache.Default.Contains(key))
+            {
+                var val = MemoryCache.Default.Get(key);
+
+                if (val != null && val is bool)
+                    return (bool) val;
+            }
+
             using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(SqlSelectPausedTriggerGroup)))
             {
                 AddCommandParameter(cmd, "triggerGroup", groupName);
                 using (IDataReader rs = cmd.ExecuteReader())
                 {
-                    return rs.Read();
+                    var exists = rs.Read();
+                    MemoryCache.Default.Add(key, exists, DateTimeOffset.UtcNow.AddSeconds(1));
+                    return exists;
                 }
             }
         }
@@ -2227,7 +2685,7 @@ namespace Quartz.Impl.AdoJobStore
         /// <param name="noEarlierThan">highest value of <see cref="ITrigger.GetNextFireTimeUtc" /> of the triggers (inclusive)</param>
         /// <param name="maxCount">maximum number of trigger keys allow to acquired in the returning list.</param>
         /// <returns>A (never null, possibly empty) list of the identifiers (Key objects) of the next triggers to be fired.</returns>
-        public virtual IList<TriggerKey> SelectTriggerToAcquire(ConnectionAndTransactionHolder conn, DateTimeOffset noLaterThan, DateTimeOffset noEarlierThan, int maxCount)
+        public virtual IList<TriggerStatus> SelectTriggerToAcquire(ConnectionAndTransactionHolder conn, DateTimeOffset noLaterThan, DateTimeOffset noEarlierThan, int maxCount)
         {
             if (maxCount < 1)
             {
@@ -2236,7 +2694,7 @@ namespace Quartz.Impl.AdoJobStore
 
             using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(GetSelectNextTriggerToAcquireSql(maxCount))))
             {
-                List<TriggerKey> nextTriggers = new List<TriggerKey>();
+                List<TriggerStatus> nextTriggers = new List<TriggerStatus>();
 
                 AddCommandParameter(cmd, "state", StateWaiting);
                 AddCommandParameter(cmd, "noLaterThan", GetDbDateTimeValue(noLaterThan));
@@ -2246,7 +2704,21 @@ namespace Quartz.Impl.AdoJobStore
                 {
                     while (rs.Read() && nextTriggers.Count < maxCount)
                     {
-                        nextTriggers.Add(new TriggerKey((string)rs[ColumnTriggerName], (string)rs[ColumnTriggerGroup]));
+                        DateTimeOffset? nextFire = null;
+
+                        if (rs[ColumnNextFireTime] != DBNull.Value)
+                        {
+                            nextFire = GetDateTimeFromDbValue(rs[ColumnNextFireTime]);
+                        }
+
+                        TriggerStatus status = new TriggerStatus(StateWaiting, nextFire);
+                        status.Key = new TriggerKey((string) rs[ColumnTriggerName],
+                            (string) rs[ColumnTriggerGroup]);
+
+                        status.JobKey = new JobKey((string)rs[ColumnJobName],
+                          (string)rs[ColumnJobGroup]);
+
+                        nextTriggers.Add(status);
                     }
                 }
                 return nextTriggers;
@@ -2297,6 +2769,12 @@ namespace Quartz.Impl.AdoJobStore
 
                 AddCommandParameter(cmd, "triggerPriority", trigger.Priority);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -2340,6 +2818,12 @@ namespace Quartz.Impl.AdoJobStore
             }
 
             AddCommandParameter(ps, "entryId", trigger.FireInstanceId);
+
+            if (conn.CreateBatchCommand)
+            {
+                conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = ps.CommandText, Parameters = ps.Parameters });
+                return -1;
+            }
 
             return ps.ExecuteNonQuery();
         }
@@ -2528,6 +3012,13 @@ namespace Quartz.Impl.AdoJobStore
             using (IDbCommand cmd = PrepareCommand(conn, ReplaceTablePrefix(SqlDeleteFiredTrigger)))
             {
                 AddCommandParameter(cmd, "triggerEntryId", entryId);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }

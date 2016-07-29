@@ -17,7 +17,11 @@
  */
 #endregion
 
+using System.Collections.Generic;
 using System.Data;
+using System.Data.Odbc;
+using System.Data.SqlClient;
+using System.Text;
 
 namespace Quartz.Impl.AdoJobStore
 {
@@ -50,5 +54,17 @@ namespace Quartz.Impl.AdoJobStore
         /// </summary>
         /// <value>The transaction.</value>
         public IDbTransaction Transaction { get; set; }
+
+        public bool CreateBatchCommand { get; set; } = false;
+
+        public List<BatchCommand> Commands { get; set; }  = new List<BatchCommand>();
+
+
+        public class BatchCommand
+        {
+            public string CommandText { get; set; }
+            public IDataParameterCollection Parameters { get; set; }
+        }
+
     }
 }

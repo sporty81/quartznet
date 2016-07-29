@@ -144,6 +144,12 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "boolean1", DbAccessor.GetDbBooleanValue(properties.Boolean1));
                 DbAccessor.AddCommandParameter(cmd, "boolean2", DbAccessor.GetDbBooleanValue(properties.Boolean2));
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -200,6 +206,12 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "boolean2", DbAccessor.GetDbBooleanValue(properties.Boolean2));
                 DbAccessor.AddCommandParameter(cmd, "triggerName", trigger.Key.Name);
                 DbAccessor.AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }

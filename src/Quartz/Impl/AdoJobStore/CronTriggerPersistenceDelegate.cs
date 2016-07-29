@@ -80,6 +80,12 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "triggerCronExpression", cronTrigger.CronExpressionString);
                 DbAccessor.AddCommandParameter(cmd, "triggerTimeZone", cronTrigger.TimeZone.Id);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
         }
@@ -123,6 +129,12 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "timeZoneId", cronTrigger.TimeZone.Id);
                 DbAccessor.AddCommandParameter(cmd, "triggerName", trigger.Key.Name);
                 DbAccessor.AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }

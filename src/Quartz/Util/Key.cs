@@ -109,7 +109,7 @@ namespace Quartz.Util
 
         public override bool Equals(object obj)
         {
-            if (this == obj)
+            if (System.Object.ReferenceEquals(this, obj))
             {
                 return true;
             }
@@ -166,5 +166,29 @@ namespace Quartz.Util
 
             return name.CompareTo(o.Name);
         }
+
+
+        public static bool operator ==(Key<T> a, Key<T> b)
+        {
+            // If both are null, or both are same instance, return true.
+            if (System.Object.ReferenceEquals(a, b))
+            {
+                return true;
+            }
+
+            // If one is null, but not both, return false.
+            if (((object)a == null) || ((object)b == null))
+            {
+                return false;
+            }
+
+            return a.Name == b.Name && a.Group == b.Group;
+        }
+
+        public static bool operator !=(Key<T> a, Key<T> b)
+        {
+            return !(a == b);
+        }
+
     }
 }

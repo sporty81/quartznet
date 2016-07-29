@@ -130,7 +130,7 @@ namespace Quartz.Impl.AdoJobStore
         /// <seealso cref="JobStoreSupport.ExecuteInNonManagedTXLock" />
         /// <seealso cref="JobStoreSupport.ExecuteInLock" />
         /// <seealso cref="JobStoreSupport.GetNonManagedTXConnection()" />
-        /// <seealso cref="JobStoreSupport.GetConnection()" />
+        /// <seealso cref="JobStoreSupport.GetConnection" />
         /// <param name="lockName">
         /// The name of the lock to acquire, for example 
         /// "TRIGGER_ACCESS".  If null, then no lock is acquired, but the

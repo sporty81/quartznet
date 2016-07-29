@@ -25,6 +25,8 @@ using System.Data;
 using Quartz.Impl.Triggers;
 using Quartz.Spi;
 using Quartz.Util;
+using System.Collections.Generic;
+using System.Text;
 
 namespace Quartz.Impl.AdoJobStore
 {
@@ -76,8 +78,76 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "triggerRepeatInterval", DbAccessor.GetDbTimeSpanValue(simpleTrigger.RepeatInterval));
                 DbAccessor.AddCommandParameter(cmd, "triggerTimesTriggered", simpleTrigger.TimesTriggered);
 
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
+
                 return cmd.ExecuteNonQuery();
             }
+        }
+
+        public Dictionary<TriggerKey, TriggerPropertyBundle> LoadExtendedTriggerPropertiesList(ConnectionAndTransactionHolder conn, List<TriggerKey> triggerKeys)
+        {
+            var triggerProps = new Dictionary<TriggerKey, TriggerPropertyBundle>();
+
+            if(triggerKeys == null || triggerKeys.Count == 0)
+                return triggerProps;
+            
+
+            using (IDbCommand cmd = DbAccessor.PrepareCommand(conn, AdoJobStoreUtil.ReplaceTablePrefix(StdAdoConstants.SqlSelectSimpleTriggerList, TablePrefix, SchedNameLiteral)))
+            {
+                {
+                    StringBuilder sb = new StringBuilder();
+
+                    sb.Append(" AND (");
+
+                    for (int i = 0; i < triggerKeys.Count; i++)
+                    {
+                        var triggerKey = triggerKeys[i];
+
+                        if (i > 0)
+                        {
+                            sb.Append(" OR ");
+                        }
+
+                        sb.AppendFormat(" ({2} = '{0}' AND {3}='{1}')", triggerKey.Name, triggerKey.Group,
+                            "TRIGGER_NAME", "TRIGGER_GROUP");
+                    }
+
+                    sb.Append(")");
+                    cmd.CommandText += sb.ToString();
+                }
+
+                using (IDataReader rs = cmd.ExecuteReader())
+                {
+                    while (rs.Read())
+                    {
+                        var key = new TriggerKey(rs.GetString("TRIGGER_NAME"), rs.GetString("TRIGGER_GROUP"));
+
+                        int repeatCount = rs.GetInt32(AdoConstants.ColumnRepeatCount);
+                        TimeSpan repeatInterval = DbAccessor.GetTimeSpanFromDbValue(rs[AdoConstants.ColumnRepeatInterval]) ?? TimeSpan.Zero;
+                        int timesTriggered = rs.GetInt32(AdoConstants.ColumnTimesTriggered);
+
+                        SimpleScheduleBuilder sb = SimpleScheduleBuilder.Create()
+                            .WithRepeatCount(repeatCount)
+                            .WithInterval(repeatInterval);
+
+                        string[] statePropertyNames = { "timesTriggered" };
+                        object[] statePropertyValues = { timesTriggered };
+                        triggerProps[key] = new TriggerPropertyBundle(sb, statePropertyNames, statePropertyValues);
+                    }
+                }
+            }
+
+            foreach (var key in triggerKeys)
+            {
+                if (!triggerProps.ContainsKey(key))
+                    triggerProps[key] = null;
+            }
+
+            return triggerProps;
         }
 
         public TriggerPropertyBundle LoadExtendedTriggerProperties(ConnectionAndTransactionHolder conn, TriggerKey triggerKey)
@@ -120,6 +190,12 @@ namespace Quartz.Impl.AdoJobStore
                 DbAccessor.AddCommandParameter(cmd, "triggerTimesTriggered", simpleTrigger.TimesTriggered);
                 DbAccessor.AddCommandParameter(cmd, "triggerName", trigger.Key.Name);
                 DbAccessor.AddCommandParameter(cmd, "triggerGroup", trigger.Key.Group);
+
+                if (conn.CreateBatchCommand)
+                {
+                    conn.Commands.Add(new ConnectionAndTransactionHolder.BatchCommand() { CommandText = cmd.CommandText, Parameters = cmd.Parameters });
+                    return -1;
+                }
 
                 return cmd.ExecuteNonQuery();
             }
