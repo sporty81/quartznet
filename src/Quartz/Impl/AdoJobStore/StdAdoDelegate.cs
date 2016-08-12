@@ -22,6 +22,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Data;
+using System.Data.SqlClient;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -151,17 +152,17 @@ namespace Quartz.Impl.AdoJobStore
         }
 
         private void ApplyBatchCommand(int commandIndex, ConnectionAndTransactionHolder.BatchCommand source, IDbCommand target)
-        {
-            foreach (IDbDataParameter item in source.Parameters)
-            {
-                source.CommandText = source.CommandText.Replace(item.ParameterName,
-                    item.ParameterName + commandIndex.ToString());
+		{
+			foreach (SqlParameter item in source.Parameters)
+			{
+				source.CommandText = source.CommandText.Replace(item.ParameterName,
+					item.ParameterName + commandIndex.ToString());
 
-                AddCommandParameter(target, item.ParameterName.TrimStart('@') + commandIndex, item.Value);
-            }
+				AddCommandParameter(target, item.ParameterName.TrimStart('@') + commandIndex, item.SqlValue);
+			}
 
-            target.CommandText += source.CommandText + ";\r\n";
-        }
+			target.CommandText += source.CommandText + ";\r\n";
+		}
 
 
         public void ExecuteBatchCommand(ConnectionAndTransactionHolder conn)
