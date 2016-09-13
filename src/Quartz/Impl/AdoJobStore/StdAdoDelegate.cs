@@ -164,7 +164,7 @@ namespace Quartz.Impl.AdoJobStore
         }
 
 
-        public void ExecuteBatchCommand(ConnectionAndTransactionHolder conn)
+        public void ExecuteBatchCommand(ConnectionAndTransactionHolder conn, int maxBatchSize)
         {
             if (!conn.CreateBatchCommand)
                 return; //skip
@@ -177,7 +177,7 @@ namespace Quartz.Impl.AdoJobStore
                 return; //nothing to do
 
             //in case there are 100 commands, take them in smaller chunks
-            foreach (var commandChunk in conn.Commands.InSetsOf(20))
+            foreach (var commandChunk in conn.Commands.InSetsOf(maxBatchSize))
             {
                 using (var command = conn.Connection.CreateCommand())
                 {
@@ -199,7 +199,7 @@ namespace Quartz.Impl.AdoJobStore
             conn.Commands.Clear();
         }
 
-        public void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName)
+        public void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName, bool useSelectDBLock, int maxBatchSize)
         {
             if (!conn.CreateBatchCommand)
                 return; //skip
@@ -213,33 +213,39 @@ namespace Quartz.Impl.AdoJobStore
             if (string.IsNullOrEmpty(lockName))
                 throw new ArgumentException("Missing lockName");
 
-            using (var command = conn.Connection.CreateCommand())
+            foreach (var commandChunk in conn.Commands.InSetsOf(maxBatchSize))
             {
-             
-                //this code is all SQL Server specific and should be changed for other dbs 
-                if (transactionLevel == IsolationLevel.Serializable)
+                using (var command = conn.Connection.CreateCommand())
                 {
-                    command.CommandText += "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\r\n";
+
+                    //this code is all SQL Server specific and should be changed for other dbs 
+                    if (transactionLevel == IsolationLevel.Serializable)
+                    {
+                        command.CommandText += "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\r\n";
+                    }
+                    else
+                    {
+                        command.CommandText += "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\r\n";
+                    }
+
+                    command.CommandText += "BEGIN TRANSACTION;\r\n";
+                    if (useSelectDBLock)
+                    {
+                        command.CommandText += "SELECT * FROM QRTZ_LOCKS WITH (UPDLOCK,ROWLOCK) WHERE SCHED_NAME = @quartzScheduleName AND LOCK_NAME = @lockName;\r\n";
+                    }
+
+                    AddCommandParameter(command, "quartzScheduleName", schedName);
+                    AddCommandParameter(command, "lockname", lockName);
+
+                    for (int i = 0; i < commandChunk.Count; i++)
+                    {
+                        ApplyBatchCommand(i, commandChunk[i], command);
+                    }
+
+                    command.CommandText += "COMMIT TRANSACTION;";
+
+                    command.ExecuteNonQuery();
                 }
-                else
-                {
-                    command.CommandText += "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;\r\n";
-                }
-
-                command.CommandText += "BEGIN TRANSACTION;\r\n";
-                command.CommandText += "SELECT * FROM QRTZ_LOCKS WITH (UPDLOCK,ROWLOCK) WHERE SCHED_NAME = @quartzScheduleName AND LOCK_NAME = @lockName;\r\n";
-
-                AddCommandParameter(command, "quartzScheduleName", schedName);
-                AddCommandParameter(command, "lockname", lockName);
-
-                for (int i = 0; i < conn.Commands.Count; i++)
-                {
-                    ApplyBatchCommand(i, conn.Commands[i], command);
-                }
-
-                command.CommandText += "COMMIT TRANSACTION;";
-
-                command.ExecuteNonQuery();
             }
 
             conn.Commands.Clear();

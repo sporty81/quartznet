@@ -211,9 +211,9 @@ namespace Quartz.Impl.AdoJobStore
 		/// <returns> an array of <see cref="String" /> group names</returns>
         IList<string> SelectJobGroups(ConnectionAndTransactionHolder conn);
 
-        void ExecuteBatchCommand(ConnectionAndTransactionHolder conn);
+        void ExecuteBatchCommand(ConnectionAndTransactionHolder conn, int maxBatchSize);
 
-        void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName);
+        void ExecuteBatchCommandTransaction(ConnectionAndTransactionHolder conn, IsolationLevel transactionLevel, string lockName, bool useSelectDBLock, int maxBatchSize);
 
 
         /// <summary>

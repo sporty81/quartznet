@@ -281,9 +281,10 @@ namespace Quartz.Impl.AdoJobStore
         public virtual bool DontSetAutoCommitFalse { get; set; }
 
 
-        public virtual bool BatchSqlUpdates { get; set; }
+        public virtual bool BatchSqlUpdates { get; set; } = true;
+        public virtual int BatchSqlUpdatesSize { get; set; } = 5;
 
-        public virtual bool BatchSqlQueries { get; set; }
+        public virtual bool BatchSqlQueries { get; set; } = true;
 
 
         /// <summary> 
@@ -991,7 +992,7 @@ namespace Quartz.Impl.AdoJobStore
 
             conn.CreateBatchCommand = this.BatchSqlUpdates;
             StoreTriggerCore(conn, newTrigger, job, replaceExisting, state, forceState, recovering, existingTrigger);
-            Delegate.ExecuteBatchCommand(conn);
+            Delegate.ExecuteBatchCommand(conn, this.BatchSqlUpdatesSize);
         }
 
         /// <summary>
@@ -2631,7 +2632,7 @@ namespace Quartz.Impl.AdoJobStore
                     }
 
                     //if batching
-                    Delegate.ExecuteBatchCommand(conn);
+                    Delegate.ExecuteBatchCommand(conn, this.BatchSqlUpdatesSize);
 
                     // if we didn't end up with any trigger to fire from that first
                     // batch, try again for another batch. We allow with a max retry count.
@@ -2747,7 +2748,7 @@ namespace Quartz.Impl.AdoJobStore
                         }
                         results.Add(result);
                     }
-                    Delegate.ExecuteBatchCommand(conn);
+                    Delegate.ExecuteBatchCommand(conn, this.BatchSqlUpdatesSize);
                     return results;
                 },
                 (conn, result) =>
@@ -3581,7 +3582,7 @@ namespace Quartz.Impl.AdoJobStore
                 conn.CreateBatchCommand = this.BatchSqlUpdates;
                 txCallback(conn); //does whatever the action was
                 //run the batch command that accumulated
-                Delegate.ExecuteBatchCommandTransaction(conn, transactionIsolationLevel, LockTriggerAccess);
+                Delegate.ExecuteBatchCommandTransaction(conn, transactionIsolationLevel, LockTriggerAccess, this.UseDBLocks, this.BatchSqlUpdatesSize);
             }
             finally 
             {
